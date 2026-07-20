@@ -1,0 +1,471 @@
+#include <WiFiManager.h>
+#include <ESP8266HTTPUpdateServer.h>
+#include <ESP8266WebServer.h>
+#include <ArduinoOTA.h>
+#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
+#include <ESP8266httpUpdate.h>
+#include <time.h>
+
+/* ==================== 硬件引脚 ==================== */
+#define RELAY1        D1    // 照明灯继电器
+#define RELAY2        D2    // 水泵继电器
+#define RELAY3        D6    // 灯 2 继电器
+#define RESET_BUTTON  D3    // 长按清空WiFi
+#define PHYSICAL_SW   D5    // 拨动开关输入（接GND）
+
+/* ==================== 设备ID ==================== */
+String DEVICE_ID;
+
+/* ==================== MQTT配置 ==================== */
+const char* mqtt_server = "b7fea2bf.ala.asia-southeast1.emqxsl.com";
+const int   mqtt_port   = 8883;
+const char* mqtt_user   = "eps8266nn";
+const char* mqtt_pass   = "yu155414";
+
+String mqtt_lamp_cmd_topic;
+String mqtt_pump_cmd_topic;
+String mqtt_lamp_status_topic;
+String mqtt_pump_status_topic;
+String mqtt_lamp_timer_topic;
+String mqtt_lamp2_cmd_topic;
+String mqtt_lamp2_status_topic;
+String mqtt_lamp2_timer_topic;
+
+/* ==================== OTA ==================== */
+const char* firmware_url = "http://esp8266-yuyu-ota.oss-cn-hangzhou.aliyuncs.com/firmware_door4.bin";
+
+/* ==================== 继电器极性 ==================== */
+bool ACTIVE_HIGH = true;
+
+/* ==================== 设备状态 ==================== */
+bool lamp1 = false;
+bool lamp2 = false;
+bool pump  = false;
+
+bool last_lamp1 = false;
+bool last_lamp2 = false;
+bool last_pump  = false;
+
+/* ==================== 定时参数 ==================== */
+bool timerEnabled   = false;
+int  timerOnHour    = 0;
+int  timerOnMinute  = 0;
+int  timerOffHour   = 0;
+int  timerOffMinute = 0;
+
+bool timer2Enabled   = false;
+int  timer2OnHour    = 0;
+int  timer2OnMinute  = 0;
+int  timer2OffHour   = 0;
+int  timer2OffMinute = 0;
+
+/* ==================== 拨动开关防抖 ==================== */
+bool          swRaw        = HIGH;
+bool          swStable     = HIGH;
+unsigned long swLastChange = 0;
+#define SW_DEBOUNCE_MS 120     // 加大防抖时间，提高夜间稳定性
+
+/* ==================== 时间变量 ==================== */
+unsigned long lastReconnectAttempt = 0;
+unsigned long lastHeartbeatTime    = 0;
+const unsigned long HEARTBEAT_INTERVAL = 300000UL;
+
+/* ==================== 对象定义 ==================== */
+ESP8266WebServer       server(80);
+ESP8266HTTPUpdateServer httpUpdater;
+WiFiClientSecure       espClient;
+PubSubClient           mqttClient(espClient);
+WiFiManager            wifiManager;
+
+/* ==================== 继电器控制 ==================== */
+void setRelay(int pin, bool state) {
+  digitalWrite(pin, ACTIVE_HIGH ? state : !state);
+}
+
+/* ==================== 状态发布 ==================== */
+void publishStatus(bool forceAll = false) {
+  if (!mqttClient.connected()) return;
+
+  if (forceAll || lamp1 != last_lamp1) {
+    mqttClient.publish(mqtt_lamp_status_topic.c_str(), lamp1 ? "ON1" : "OFF1", true);
+    last_lamp1 = lamp1;
+  }
+
+  if (forceAll || lamp2 != last_lamp2) {
+    mqttClient.publish(mqtt_lamp2_status_topic.c_str(), lamp2 ? "ON2" : "OFF2", true);
+    last_lamp2 = lamp2;
+  }
+
+  if (forceAll || pump != last_pump) {
+    mqttClient.publish(mqtt_pump_status_topic.c_str(), pump ? "PUMP_ON" : "PUMP_OFF", true);
+    last_pump = pump;
+  }
+
+  if (forceAll) {
+    if (timerEnabled) {
+      char timerMsg[32];
+      snprintf(timerMsg, sizeof(timerMsg), "TIMER:%02d:%02d:%02d:%02d",
+               timerOnHour, timerOnMinute, timerOffHour, timerOffMinute);
+      mqttClient.publish(mqtt_lamp_timer_topic.c_str(), timerMsg, true);
+    } else {
+      mqttClient.publish(mqtt_lamp_timer_topic.c_str(), "TIMER_OFF", true);
+    }
+
+    if (timer2Enabled) {
+      char timer2Msg[32];
+      snprintf(timer2Msg, sizeof(timer2Msg), "TIMER:%02d:%02d:%02d:%02d",
+               timer2OnHour, timer2OnMinute, timer2OffHour, timer2OffMinute);
+      mqttClient.publish(mqtt_lamp2_timer_topic.c_str(), timer2Msg, true);
+    } else {
+      mqttClient.publish(mqtt_lamp2_timer_topic.c_str(), "TIMER_OFF", true);
+    }
+  }
+}
+
+/* ==================== MQTT 回调 ==================== */
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  String topicStr = String(topic);
+
+  if (topicStr == mqtt_lamp_cmd_topic) {
+    if (msg == "ON1" || msg == "ON") {
+      lamp1 = true;
+      setRelay(RELAY1, true);
+      publishStatus();
+    }
+    else if (msg == "OFF1" || msg == "OFF") {
+      lamp1 = false;
+      setRelay(RELAY1, false);
+      publishStatus();
+    }
+    else if (msg == "QUERY_STATE") {
+      publishStatus(true);
+    }
+    else if (msg == "OTA") {
+      handleOTA();
+    }
+  }
+  else if (topicStr == mqtt_lamp2_cmd_topic) {
+    if (msg == "ON2" || msg == "ON") {
+      lamp2 = true;
+      setRelay(RELAY3, true);
+      publishStatus();
+    }
+    else if (msg == "OFF2" || msg == "OFF") {
+      lamp2 = false;
+      setRelay(RELAY3, false);
+      publishStatus();
+    }
+    else if (msg == "QUERY_STATE") {
+      publishStatus(true);
+    }
+  }
+  else if (topicStr == mqtt_pump_cmd_topic) {
+    if (msg == "PUMP_ON" || msg == "ON2") {
+      pump = true;
+      setRelay(RELAY2, true);
+      publishStatus();
+    }
+    else if (msg == "PUMP_OFF" || msg == "OFF2") {
+      pump = false;
+      setRelay(RELAY2, false);
+      publishStatus();
+    }
+    else if (msg == "QUERY_STATE") {
+      publishStatus(true);
+    }
+  }
+  else if (topicStr == mqtt_lamp_timer_topic) {
+    if (msg == "TIMER_OFF") {
+      timerEnabled = false;
+      Serial.println("Timer OFF");
+    }
+    else if (msg.startsWith("TIMER:")) {
+      int v[4] = {0};
+      int idx = 0;
+      String token = "";
+      String payload_str = msg.substring(6);
+      for (unsigned int i = 0; i <= payload_str.length(); i++) {
+        char c = (i < payload_str.length()) ? payload_str[i] : ':';
+        if (c == ':') {
+          if (idx < 4) v[idx++] = token.toInt();
+          token = "";
+        } else {
+          token += c;
+        }
+      }
+      if (idx == 4) {
+        timerOnHour    = v[0];
+        timerOnMinute  = v[1];
+        timerOffHour   = v[2];
+        timerOffMinute = v[3];
+        timerEnabled   = true;
+        Serial.printf("Timer set: %02d:%02d ON → %02d:%02d OFF\n", timerOnHour, timerOnMinute, timerOffHour, timerOffMinute);
+      }
+    }
+  }
+  else if (topicStr == mqtt_lamp2_timer_topic) {
+    if (msg == "TIMER_OFF") {
+      timer2Enabled = false;
+      Serial.println("Lamp 2 timer OFF");
+    }
+    else if (msg.startsWith("TIMER:")) {
+      int v[4] = {0};
+      int idx = 0;
+      String token = "";
+      String payload_str = msg.substring(6);
+      for (unsigned int i = 0; i <= payload_str.length(); i++) {
+        char c = (i < payload_str.length()) ? payload_str[i] : ':';
+        if (c == ':') {
+          if (idx < 4) v[idx++] = token.toInt();
+          token = "";
+        } else {
+          token += c;
+        }
+      }
+      if (idx == 4) {
+        timer2OnHour = v[0];
+        timer2OnMinute = v[1];
+        timer2OffHour = v[2];
+        timer2OffMinute = v[3];
+        timer2Enabled = true;
+        Serial.printf("Lamp 2 timer: %02d:%02d ON -> %02d:%02d OFF\n", timer2OnHour, timer2OnMinute, timer2OffHour, timer2OffMinute);
+      }
+    }
+  }
+}
+
+/* ==================== OTA ==================== */
+void handleOTA() {
+  mqttClient.publish(mqtt_lamp_status_topic.c_str(), "OTA_START", true);
+  Serial.println("OTA start...");
+
+  WiFiClient client;
+  ESPhttpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  t_httpUpdate_return ret = ESPhttpUpdate.update(client, firmware_url);
+
+  switch(ret) {
+    case HTTP_UPDATE_OK:
+      Serial.println("OTA OK");
+      mqttClient.publish(mqtt_lamp_status_topic.c_str(), "OTA_OK", true);
+      delay(1500);
+      ESP.restart();
+      break;
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("OTA FAIL: %d %s\n", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+      mqttClient.publish(mqtt_lamp_status_topic.c_str(), "OTA_FAIL", true);
+      break;
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("OTA NO UPDATE");
+      mqttClient.publish(mqtt_lamp_status_topic.c_str(), "OTA_NO_NEW_FIRMWARE", true);
+      break;
+  }
+}
+
+/* ==================== MQTT 连接 ==================== */
+void connectMQTT() {
+  if (mqttClient.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastReconnectAttempt > 5000UL) {
+    lastReconnectAttempt = now;
+    String clientId = "esp8266_" + DEVICE_ID;
+
+    if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+      Serial.println("MQTT connected");
+      mqttClient.subscribe(mqtt_lamp_cmd_topic.c_str());
+      mqttClient.subscribe(mqtt_pump_cmd_topic.c_str());
+      mqttClient.subscribe(mqtt_lamp_timer_topic.c_str());
+      mqttClient.subscribe(mqtt_lamp2_cmd_topic.c_str());
+      mqttClient.subscribe(mqtt_lamp2_timer_topic.c_str());
+      delay(300);
+      publishStatus(true);
+    } else {
+      Serial.print("MQTT fail, rc=");
+      Serial.println(mqttClient.state());
+    }
+  }
+}
+
+/* ==================== 定时器 ==================== */
+void checkTimer() {
+  if (!timerEnabled && !timer2Enabled) return;
+
+  time_t now = time(nullptr);
+  struct tm* p_tm = localtime(&now);
+  if (p_tm->tm_year < 120) return;
+
+  int currentMinutes = p_tm->tm_hour * 60 + p_tm->tm_min;
+  int onMinutes      = timerOnHour  * 60 + timerOnMinute;
+  int offMinutes     = timerOffHour * 60 + timerOffMinute;
+
+  bool shouldBeOn = (onMinutes < offMinutes) ?
+                    (currentMinutes >= onMinutes && currentMinutes < offMinutes) :
+                    (currentMinutes >= onMinutes || currentMinutes < offMinutes);
+
+  if (timerEnabled && shouldBeOn && !lamp1) {
+    lamp1 = true;
+    setRelay(RELAY1, true);
+    publishStatus();
+    Serial.printf("【定时器】自动开启 %02d:%02d\n", p_tm->tm_hour, p_tm->tm_min);
+  } 
+  else if (timerEnabled && !shouldBeOn && lamp1) {
+    lamp1 = false;
+    setRelay(RELAY1, false);
+    publishStatus();
+    Serial.printf("【定时器】自动关闭 %02d:%02d\n", p_tm->tm_hour, p_tm->tm_min);
+  }
+
+  if (timer2Enabled) {
+    int on2Minutes = timer2OnHour * 60 + timer2OnMinute;
+    int off2Minutes = timer2OffHour * 60 + timer2OffMinute;
+    bool lamp2ShouldBeOn = (on2Minutes < off2Minutes) ?
+                           (currentMinutes >= on2Minutes && currentMinutes < off2Minutes) :
+                           (currentMinutes >= on2Minutes || currentMinutes < off2Minutes);
+
+    if (lamp2ShouldBeOn != lamp2) {
+      lamp2 = lamp2ShouldBeOn;
+      setRelay(RELAY3, lamp2);
+      publishStatus();
+      Serial.printf("【灯 2 定时器】自动%s %02d:%02d\n", lamp2 ? "开启" : "关闭", p_tm->tm_hour, p_tm->tm_min);
+    }
+  }
+}
+
+/* ==================== 拨动开关检测（加强版） ==================== */
+void checkPhysicalSwitch() {
+  bool reading = digitalRead(PHYSICAL_SW);
+  unsigned long currentMillis = millis();
+
+  if (reading != swRaw) {
+    swRaw = reading;
+    swLastChange = currentMillis;
+    // Serial.printf("SW raw change: %d\n", reading);   // 调试时可打开
+  }
+
+  // 正常防抖处理
+  if ((currentMillis - swLastChange) >= SW_DEBOUNCE_MS && swRaw != swStable) {
+    swStable = swRaw;
+
+    bool newLampState = (swStable == LOW);
+    if (newLampState != lamp1) {
+      lamp1 = newLampState;
+      setRelay(RELAY1, lamp1);
+      publishStatus();
+      Serial.printf("【拨动开关】动作 → 灯 %s\n", lamp1 ? "ON" : "OFF");
+    }
+  }
+
+  // 每10秒强制同步一次，防止状态机卡死
+  static unsigned long lastForceRefresh = 0;
+  if (currentMillis - lastForceRefresh > 10000) {
+    lastForceRefresh = currentMillis;
+    bool currentState = digitalRead(PHYSICAL_SW);
+    if (currentState != swStable) {
+      swStable = currentState;
+      bool newState = (swStable == LOW);
+      if (newState != lamp1) {
+        lamp1 = newState;
+        setRelay(RELAY1, lamp1);
+        publishStatus();
+        Serial.println("【拨动开关】强制状态同步");
+      }
+    }
+  }
+}
+
+/* ==================== Setup ==================== */
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  DEVICE_ID = String(ESP.getChipId(), HEX);
+  Serial.print("Device ID: ");
+  Serial.println(DEVICE_ID);
+
+  mqtt_lamp_cmd_topic    = "home/" + DEVICE_ID + "/lamp/cmd";
+  mqtt_pump_cmd_topic    = "home/" + DEVICE_ID + "/pump/cmd";
+  mqtt_lamp_status_topic = "home/" + DEVICE_ID + "/lamp/status";
+  mqtt_pump_status_topic = "home/" + DEVICE_ID + "/pump/status";
+  mqtt_lamp_timer_topic   = "home/" + DEVICE_ID + "/lamp/timer";
+  mqtt_lamp2_cmd_topic    = "home/" + DEVICE_ID + "/lamp2/cmd";
+  mqtt_lamp2_status_topic = "home/" + DEVICE_ID + "/lamp2/status";
+  mqtt_lamp2_timer_topic  = "home/" + DEVICE_ID + "/lamp2/timer";
+
+  pinMode(RELAY1,       OUTPUT);
+  pinMode(RELAY2,       OUTPUT);
+  pinMode(RELAY3,       OUTPUT);
+  pinMode(RESET_BUTTON, INPUT_PULLUP);
+  pinMode(PHYSICAL_SW,  INPUT_PULLUP);
+
+  setRelay(RELAY1, false);
+  setRelay(RELAY2, false);
+  setRelay(RELAY3, false);
+
+  // 长按清空WiFi
+  if (digitalRead(RESET_BUTTON) == LOW) {
+    Serial.println("Reset WiFi...");
+    wifiManager.resetSettings();
+    delay(800);
+  }
+
+  wifiManager.setConfigPortalTimeout(180);
+  String apName = "ESP_Config_" + DEVICE_ID;
+  if (!wifiManager.autoConnect(apName.c_str(), "12345678")) {
+    ESP.restart();
+  }
+
+  Serial.println("WiFi connected");
+  configTime(8 * 3600, 0, "ntp.aliyun.com", "time.windows.com");
+
+  // 初始化拨动开关
+  swRaw = digitalRead(PHYSICAL_SW);
+  swStable = swRaw;
+  lamp1 = (swStable == LOW);
+  setRelay(RELAY1, lamp1);
+  swLastChange = millis();
+
+  timerEnabled = false;   // 开机默认关闭定时器
+  Serial.println("Timer auto disabled on boot");
+
+  espClient.setInsecure();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+
+  ArduinoOTA.begin();
+  httpUpdater.setup(&server);
+  server.begin();
+
+  publishStatus(true);
+  Serial.println("System ready");
+}
+
+/* ==================== Loop ==================== */
+void loop() {
+  ArduinoOTA.handle();
+  server.handleClient();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    connectMQTT();
+    mqttClient.loop();
+  }
+
+  checkPhysicalSwitch();
+
+  if (millis() - lastHeartbeatTime > HEARTBEAT_INTERVAL) {
+    lastHeartbeatTime = millis();
+    publishStatus(false);
+  }
+
+  static unsigned long lastTimerCheck = 0;
+  if (millis() - lastTimerCheck > 60000 || lastTimerCheck == 0) {
+    lastTimerCheck = millis();
+    checkTimer();
+  }
+
+  delay(5);   // 稍微加快loop响应
+}
