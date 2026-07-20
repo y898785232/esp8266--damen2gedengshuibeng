@@ -183,7 +183,7 @@
 let DEVICE_ID = localStorage.getItem("smart_home_device_id");
 
 if (!DEVICE_ID) {
-  DEVICE_ID = String(ESP.getChipId(), HEX);
+  DEVICE_ID = prompt("请输入设备ID（串口日志里的 Device ID，例如: 772ef9）", "");
   if (DEVICE_ID) localStorage.setItem("smart_home_device_id", DEVICE_ID);
 }
 
