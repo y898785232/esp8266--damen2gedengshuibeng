@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智能家居控制系统</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+  body { text-align: center; font-family: Arial, sans-serif; background: #f0f2f5; padding-top: 28px; margin: 0; font-size: 11px; }
+  h2 { color: #333; margin-bottom: 5px; font-size: 18px; }
+  .dev-id { color: #888; font-size: 10px; margin-bottom: 21px; }
+
+  .toggle-switch {
+    position: relative; display: inline-block; width: 266px; height: 112px; margin: 14px;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+    background: #ccc; border-radius: 56px; transition: 0.4s; box-shadow: 0 6px 18px rgba(0,0,0,0.2);
+  }
+  .slider:before {
+    position: absolute; content: ""; height: 98px; width: 98px; left: 7px; bottom: 7px;
+    background: white; border-radius: 50%; transition: 0.4s;
+  }
+  input:checked + .slider { background: #28a745; }
+  input:checked + .slider:before { transform: translateX(147px); }
+  .slider span {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    font-size: 22px; font-weight: bold; color: white;
+  }
+  .off { left: 38px; }
+  .on  { right: 38px; opacity: 0; }
+  input:checked + .slider .off { opacity: 0; }
+  input:checked + .slider .on  { opacity: 1; }
+
+  button {
+    width: 196px; height: 60px; font-size: 20px; margin: 10px;
+    border: none; border-radius: 10px; cursor: pointer; font-weight: bold;
+  }
+  .lamp-on  { background: #28a745; color: white; }
+  .lamp-off { background: #dc3545; color: white; }
+
+  .status-bar {
+    display: inline-block; padding: 6px 17px; border-radius: 14px;
+    font-weight: bold; font-size: 11px; margin-bottom: 14px;
+  }
+  .online  { background: #e6f7ed; color: #1f8b4c; }
+  .offline { background: #ffebeb; color: #dc3545; }
+
+  .timer-panel {
+    display: inline-block; background: white; border-radius: 12px;
+    padding: 17px 25px; margin: 14px auto; box-shadow: 0 3px 12px rgba(0,0,0,0.10);
+    text-align: left; width: 238px;
+  }
+  .timer-panel h3 { margin: 0 0 11px; color: #333; text-align: center; font-size: 14px; }
+  .timer-row { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; }
+  .timer-row label { font-size: 11px; color: #555; font-weight: bold; }
+  .timer-row input[type="time"] {
+    font-size: 14px; padding: 4px 7px; border: 2px solid #ddd;
+    border-radius: 6px; outline: none; width: 98px; text-align: center;
+  }
+  .timer-row input[type="time"]:focus { border-color: #28a745; }
+
+  .timer-enable-row { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 11px 0 6px; }
+  .timer-enable-row label { font-size: 11px; color: #555; }
+
+  .btn-save {
+    width: 100%; height: 36px; font-size: 14px; margin: 8px 0 0;
+    background: #007bff; color: white; border: none; border-radius: 8px;
+    cursor: pointer; font-weight: bold;
+  }
+  .btn-save:hover { background: #0056b3; }
+  .btn-save:disabled { background: #aaa; cursor: not-allowed; }
+
+  .timer-status {
+    text-align: center; font-size: 10px; color: #888; margin-top: 6px; min-height: 14px;
+  }
+
+  .ota-panel {
+    display: inline-block; background: white; border-radius: 12px;
+    padding: 14px 25px; margin: 14px auto; box-shadow: 0 3px 12px rgba(0,0,0,0.10);
+    width: 238px;
+  }
+  .btn-ota {
+    width: 100%; height: 40px; font-size: 14px;
+    background: #ff9500; color: white; border: none; border-radius: 8px;
+    cursor: pointer; font-weight: bold; margin-top: 6px;
+  }
+  .btn-ota:hover { background: #e08800; }
+  .ota-status { font-size: 10px; color: #888; margin-top: 6px; min-height: 14px; text-align: center; }
+
+  .device-offline-tip {
+    color: #dc3545; font-size: 11px; margin-top: 6px; display: none;
+  }
+  </style>
+</head>
+<body>
+  <h2>🏠 智能家居控制系统</h2>
+  <div class="dev-id">设备 ID: <span id="deviceIdDisplay"></span></div>
+
+  <div id="netStatus" class="status-bar offline">正在连接云端...</div>
+  <div class="device-offline-tip" id="offlineTip">⚠️ 设备离线或未通电</div>
+
+  <p><strong>🚰 水泵遥控开关</strong></p>
+  <label class="toggle-switch">
+    <input type="checkbox" id="pumpSwitch" onchange="handlePump(this)">
+    <div class="slider">
+      <span class="off">🚫 关闭</span>
+      <span class="on">✅ 开启</span>
+    </div>
+  </label>
+
+  <br><hr style="width: 80%; border: 0.5px solid #ddd;"><br>
+
+  <p><strong>💡 大棚照明（灯 1）</strong></p>
+  <button id="lampBtn" class="lamp-off" onclick="toggleLamp()">灯 1 关</button>
+
+  <br>
+
+  <!-- 定时面板 -->
+  <div class="timer-panel">
+    <h3>⏰ 灯定时设置</h3>
+
+    <div class="timer-enable-row">
+      <input type="checkbox" id="timerEnable" onchange="onTimerEnableChange()">
+      <label for="timerEnable">启用定时自动开关灯</label>
+    </div>
+
+    <div id="timerInputs" style="opacity:0.4; pointer-events:none;">
+      <div class="timer-row">
+        <label>🌅 开灯时间</label>
+        <input type="time" id="timeOn" value="18:00">
+      </div>
+      <div class="timer-row">
+        <label>🌙 关灯时间</label>
+        <input type="time" id="timeOff" value="22:00">
+      </div>
+    </div>
+
+    <button class="btn-save" id="btnSave" onclick="saveTimer()">保存定时设置</button>
+    <div class="timer-status" id="timerStatus">尚未设置定时</div>
+  </div>
+
+  <br><hr style="width: 80%; border: 0.5px solid #ddd;"><br>
+
+  <p><strong>💡 大棚照明（灯 2）</strong></p>
+  <button id="lamp2Btn" class="lamp-off" onclick="toggleLamp2()">灯 2 关</button>
+
+  <br>
+
+  <div class="timer-panel">
+    <h3>⏰ 灯 2 定时设置</h3>
+
+    <div class="timer-enable-row">
+      <input type="checkbox" id="timer2Enable" onchange="onTimer2EnableChange()">
+      <label for="timer2Enable">启用灯 2 定时自动开关</label>
+    </div>
+
+    <div id="timer2Inputs" style="opacity:0.4; pointer-events:none;">
+      <div class="timer-row">
+        <label>🌅 开灯时间</label>
+        <input type="time" id="time2On" value="18:00">
+      </div>
+      <div class="timer-row">
+        <label>🌙 关灯时间</label>
+        <input type="time" id="time2Off" value="22:00">
+      </div>
+    </div>
+
+    <button class="btn-save" id="btn2Save" onclick="saveTimer2()">保存灯 2 定时</button>
+    <div class="timer-status" id="timer2Status">尚未设置定时</div>
+  </div>
+
+  <!-- OTA升级面板 -->
+  <div class="ota-panel">
+    <h3>⚙️ 系统维护</h3>
+    <button class="btn-ota" onclick="triggerOTA()">🚀 远程 OTA 升级</button>
+    <div class="ota-status" id="otaStatus"></div>
+  </div>
+
+<script>
+// ==================== 设备ID配置 ====================
+let DEVICE_ID = localStorage.getItem("smart_home_device_id");
+
+if (!DEVICE_ID) {
+  DEVICE_ID = ********
+  if (DEVICE_ID) localStorage.setItem("smart_home_device_id", DEVICE_ID);
+}
+
+document.getElementById("deviceIdDisplay").innerText = DEVICE_ID;
+
+// ==================== Topic配置 ====================
+const BROKER_URL      = "wss://b7fea2bf.ala.asia-southeast1.emqxsl.com:8084/mqtt";
+const lampCmdTopic    = `home/${DEVICE_ID}/lamp/cmd`;
+const pumpCmdTopic    = `home/${DEVICE_ID}/pump/cmd`;
+const lampStatusTopic = `home/${DEVICE_ID}/lamp/status`;
+const pumpStatusTopic = `home/${DEVICE_ID}/pump/status`;
+const lampTimerTopic   = `home/${DEVICE_ID}/lamp/timer`;
+const lamp2CmdTopic     = `home/${DEVICE_ID}/lamp2/cmd`;
+const lamp2StatusTopic  = `home/${DEVICE_ID}/lamp2/status`;
+const lamp2TimerTopic   = `home/${DEVICE_ID}/lamp2/timer`;
+
+let lamp1State = false;
+let lamp2State = false;
+let lastSeen   = 0;
+
+// ==================== MQTT连接 ====================
+const client = mqtt.connect(BROKER_URL, {
+  clientId: 'web_' + Math.random().toString(16).substr(2, 8),
+  username: 'eps8266nn',
+  password: 'yu155414',
+  clean: true,
+  connectTimeout: 10000,
+  reconnectPeriod: 5000,
+  keepalive: 60
+});
+
+// ==================== 连接事件 ====================
+client.on('connect', () => {
+  console.log("MQTT connected");
+  const statusEl = document.getElementById("netStatus");
+  statusEl.textContent = "🟢 云端已连接";
+  statusEl.className = "status-bar online";
+
+  client.subscribe(lampStatusTopic, { qos: 1 });
+  client.subscribe(pumpStatusTopic, { qos: 1 });
+  client.subscribe(lampTimerTopic,   { qos: 1 });
+  client.subscribe(lamp2StatusTopic, { qos: 1 });
+  client.subscribe(lamp2TimerTopic,  { qos: 1 });
+
+  // 连接后查询设备当前状态
+  setTimeout(() => {
+    client.publish(lampCmdTopic, "QUERY_STATE", { qos: 1 });
+    client.publish(lamp2CmdTopic, "QUERY_STATE", { qos: 1 });
+  }, 600);
+});
+
+client.on('reconnect', () => console.log("Reconnecting..."));
+client.on('close', () => {
+  const statusEl = document.getElementById("netStatus");
+  statusEl.textContent = "🔴 云端已断开";
+  statusEl.className = "status-bar offline";
+});
+client.on('error', (err) => console.error("MQTT error:", err));
+
+// ==================== 接收消息 ====================
+client.on('message', (topic, message) => {
+  const msg = message.toString().trim();
+  console.log(`[${topic}]: ${msg}`);
+  lastSeen = Date.now();
+  document.getElementById("offlineTip").style.display = "none";
+
+  if (topic === pumpStatusTopic) {
+    if (msg === "PUMP_ON")  document.getElementById("pumpSwitch").checked = true;
+    if (msg === "PUMP_OFF") document.getElementById("pumpSwitch").checked = false;
+  }
+  else if (topic === lampStatusTopic) {
+    const btn = document.getElementById("lampBtn");
+    if (msg === "ON1") {
+      lamp1State = true;
+      btn.textContent = "灯 1 开";
+      btn.className = "lamp-on";
+    } else if (msg === "OFF1") {
+      lamp1State = false;
+      btn.textContent = "灯 1 关";
+      btn.className = "lamp-off";
+    } else if (msg === "OTA_START") {
+      document.getElementById("otaStatus").textContent = "🚀 正在升级固件，请勿断电...";
+    } else if (msg === "OTA_OK") {
+      document.getElementById("otaStatus").textContent = "✅ 升级成功，设备重启中...";
+    } else if (msg === "OTA_FAIL") {
+      document.getElementById("otaStatus").textContent = "❌ 升级失败，请重试";
+    }
+  }
+  else if (topic === lamp2StatusTopic) {
+    const btn = document.getElementById("lamp2Btn");
+    if (msg === "ON2") {
+      lamp2State = true;
+      btn.textContent = "灯 2 开";
+      btn.className = "lamp-on";
+    } else if (msg === "OFF2") {
+      lamp2State = false;
+      btn.textContent = "灯 2 关";
+      btn.className = "lamp-off";
+    }
+  }
+  else if (topic === lampTimerTopic) {
+    if (msg === "TIMER_OFF") {
+      document.getElementById("timerEnable").checked = false;
+      setTimerInputsEnabled(false);
+      document.getElementById("timerStatus").textContent = "定时已关闭";
+    } else if (msg.startsWith("TIMER:")) {
+      const parts = msg.substring(6).split(":");
+      if (parts.length === 4) {
+        document.getElementById("timerEnable").checked = true;
+        setTimerInputsEnabled(true);
+        document.getElementById("timeOn").value  = parts[0].padStart(2,"0") + ":" + parts[1].padStart(2,"0");
+        document.getElementById("timeOff").value = parts[2].padStart(2,"0") + ":" + parts[3].padStart(2,"0");
+        document.getElementById("timerStatus").textContent =
+          `✅ 已生效：${parts[0]}:${parts[1]} 开灯，${parts[2]}:${parts[3]} 关灯`;
+      }
+    }
+  }
+  else if (topic === lamp2TimerTopic) {
+    if (msg === "TIMER_OFF") {
+      document.getElementById("timer2Enable").checked = false;
+      setTimer2InputsEnabled(false);
+      document.getElementById("timer2Status").textContent = "定时已关闭";
+    } else if (msg.startsWith("TIMER:")) {
+      const parts = msg.substring(6).split(":");
+      if (parts.length === 4) {
+        document.getElementById("timer2Enable").checked = true;
+        setTimer2InputsEnabled(true);
+        document.getElementById("time2On").value = parts[0].padStart(2, "0") + ":" + parts[1].padStart(2, "0");
+        document.getElementById("time2Off").value = parts[2].padStart(2, "0") + ":" + parts[3].padStart(2, "0");
+        document.getElementById("timer2Status").textContent =
+          `✅ 已生效：${parts[0]}:${parts[1]} 开灯，${parts[2]}:${parts[3]} 关灯`;
+      }
+    }
+  }
+});
+
+// ==================== 离线检测（6分钟）====================
+setInterval(() => {
+  if (lastSeen > 0 && Date.now() - lastSeen > 360000) {
+    document.getElementById("offlineTip").style.display = "block";
+  }
+}, 5000);
+
+// ==================== 定时面板交互 ====================
+function onTimerEnableChange() {
+  setTimerInputsEnabled(document.getElementById("timerEnable").checked);
+}
+
+function setTimerInputsEnabled(enabled) {
+  const inputs = document.getElementById("timerInputs");
+  inputs.style.opacity = enabled ? "1" : "0.4";
+  inputs.style.pointerEvents = enabled ? "auto" : "none";
+}
+
+function saveTimer() {
+  const enabled = document.getElementById("timerEnable").checked;
+  const btn = document.getElementById("btnSave");
+
+  if (!enabled) {
+    client.publish(lampTimerTopic, "TIMER_OFF", { qos: 1, retain: true });
+    document.getElementById("timerStatus").textContent = "定时已关闭";
+    return;
+  }
+
+  const timeOn  = document.getElementById("timeOn").value;
+  const timeOff = document.getElementById("timeOff").value;
+
+  if (!timeOn || !timeOff) {
+    alert("请选择开灯和关灯时间");
+    return;
+  }
+
+  const [onH, onM]   = timeOn.split(":");
+  const [offH, offM] = timeOff.split(":");
+  const cmd = `TIMER:${onH}:${onM}:${offH}:${offM}`;
+
+  btn.disabled = true;
+  btn.textContent = "发送中...";
+
+  client.publish(lampTimerTopic, cmd, { qos: 1, retain: true }, () => {
+    btn.disabled = false;
+    btn.textContent = "保存定时设置";
+    document.getElementById("timerStatus").textContent =
+      `✅ 已生效：${timeOn} 开灯，${timeOff} 关灯`;
+  });
+}
+
+function onTimer2EnableChange() {
+  setTimer2InputsEnabled(document.getElementById("timer2Enable").checked);
+}
+
+function setTimer2InputsEnabled(enabled) {
+  const inputs = document.getElementById("timer2Inputs");
+  inputs.style.opacity = enabled ? "1" : "0.4";
+  inputs.style.pointerEvents = enabled ? "auto" : "none";
+}
+
+function saveTimer2() {
+  const enabled = document.getElementById("timer2Enable").checked;
+  const btn = document.getElementById("btn2Save");
+
+  if (!enabled) {
+    client.publish(lamp2TimerTopic, "TIMER_OFF", { qos: 1, retain: true });
+    document.getElementById("timer2Status").textContent = "定时已关闭";
+    return;
+  }
+
+  const timeOn = document.getElementById("time2On").value;
+  const timeOff = document.getElementById("time2Off").value;
+  if (!timeOn || !timeOff) {
+    alert("请选择灯 2 的开灯和关灯时间");
+    return;
+  }
+
+  const [onH, onM] = timeOn.split(":");
+  const [offH, offM] = timeOff.split(":");
+  const cmd = `TIMER:${onH}:${onM}:${offH}:${offM}`;
+
+  btn.disabled = true;
+  btn.textContent = "发送中...";
+  client.publish(lamp2TimerTopic, cmd, { qos: 1, retain: true }, () => {
+    btn.disabled = false;
+    btn.textContent = "保存灯 2 定时";
+    document.getElementById("timer2Status").textContent =
+      `✅ 已生效：${timeOn} 开灯，${timeOff} 关灯`;
+  });
+}
+
+// ==================== 控制函数 ====================
+function handlePump(cb) {
+  client.publish(pumpCmdTopic, cb.checked ? 'PUMP_ON' : 'PUMP_OFF', { qos: 1 });
+}
+
+function toggleLamp() {
+  client.publish(lampCmdTopic, lamp1State ? 'OFF1' : 'ON1', { qos: 1 });
+}
+
+function toggleLamp2() {
+  client.publish(lamp2CmdTopic, lamp2State ? 'OFF2' : 'ON2', { qos: 1 });
+}
+
+function triggerOTA() {
+  if (confirm("确定要进行远程固件升级吗？\n升级期间设备会重启。")) {
+    client.publish(lampCmdTopic, "OTA", { qos: 1 });
+    document.getElementById("otaStatus").textContent = "🚀 OTA指令已发送，等待设备响应...";
+  }
+}
+</script>
+</body>
+</html>
